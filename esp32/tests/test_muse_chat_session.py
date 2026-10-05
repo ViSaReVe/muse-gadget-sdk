@@ -192,6 +192,20 @@ static void capped_typed() {
     assert(!strcmp(console_type, "done"));
     assert(!strcmp(console_fields, "\"messages\":0,\"complete\":false"));
 }
+static void completed_voice_at_cap(bool busy, int64_t quiet_us) {
+    begin();
+    clock_us = s_turn.start_us + TURN_CAP_US - quiet_us;
+    event("message.assistant", "reply", "note", "Complete reply");
+    s_turn.msgs[0].tts = TTS_FINISHED;
+    s_turn.agent_busy = busy;
+    clock_us = s_turn.start_us + TURN_CAP_US;
+    check_turn();
+    assert(s_turn.phase == P_WAIT_REPLY && !done_events);
+    clock_us++;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && done_events == 1 && !done_text[0]);
+    assert(!console_events);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     switch (atoi(argv[1])) {
@@ -202,6 +216,9 @@ int main(int argc, char **argv) {
     case 4: capped_voice(true); break;
     case 5: completed_voice(); break;
     case 6: capped_typed(); break;
+    case 7: completed_voice_at_cap(false, 1000000); break;
+    case 8: completed_voice_at_cap(true, 1000000); break;
+    case 9: completed_voice_at_cap(true, 4000000); break;
     default: return 2;
     }
 }
@@ -246,3 +263,8 @@ int main(int argc, char **argv) {
 
     def test_typed_cap_keeps_complete_false(self):
         self.run_case(6)
+
+    def test_completed_voice_at_cap_has_empty_done_text_during_settle_or_busy_hold(self):
+        for name, case in [('idle settle', 7), ('busy settle', 8), ('busy hold', 9)]:
+            with self.subTest(window=name):
+                self.run_case(case)
