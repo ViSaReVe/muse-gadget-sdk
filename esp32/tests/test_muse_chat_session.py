@@ -206,6 +206,17 @@ static void completed_voice_at_cap(bool busy, int64_t quiet_us) {
     assert(s_turn.phase == P_IDLE && done_events == 1 && !done_text[0]);
     assert(!console_events);
 }
+static void capped_voice_with_pending_playback(tts_t state) {
+    begin();
+    event("message.assistant", "reply", "note", "Complete reply");
+    assert(s_turn.msgs[0].done);
+    s_turn.msgs[0].tts = state;
+    clock_us = s_turn.start_us + TURN_CAP_US + 1;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && done_events == 1);
+    assert(!strcmp(done_text, "REPLY INCOMPLETE"));
+    assert(!console_events);
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     switch (atoi(argv[1])) {
@@ -219,6 +230,8 @@ int main(int argc, char **argv) {
     case 7: completed_voice_at_cap(false, 1000000); break;
     case 8: completed_voice_at_cap(true, 1000000); break;
     case 9: completed_voice_at_cap(true, 4000000); break;
+    case 10: capped_voice_with_pending_playback(TTS_QUEUED); break;
+    case 11: capped_voice_with_pending_playback(TTS_ACTIVE); break;
     default: return 2;
     }
 }
@@ -267,4 +280,9 @@ int main(int argc, char **argv) {
     def test_completed_voice_at_cap_has_empty_done_text_during_settle_or_busy_hold(self):
         for name, case in [('idle settle', 7), ('busy settle', 8), ('busy hold', 9)]:
             with self.subTest(window=name):
+                self.run_case(case)
+
+    def test_capped_voice_with_queued_or_active_playback_is_incomplete(self):
+        for name, case in [('queued', 10), ('active', 11)]:
+            with self.subTest(playback=name):
                 self.run_case(case)
