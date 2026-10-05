@@ -978,7 +978,7 @@ static void turn_done(bool complete)
         muse_hatch_console("done", nullptr, "\"messages\":%d,\"complete\":%s", s_turn.nmsgs,
                            complete ? "true" : "false");
     }
-    emit(MUSE_HATCH_EV_DONE, nullptr);
+    emit(MUSE_HATCH_EV_DONE, complete ? nullptr : "REPLY INCOMPLETE");
     turn_finish();
 }
 
