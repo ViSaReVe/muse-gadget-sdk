@@ -27,6 +27,8 @@ class ChatSession(unittest.TestCase):
         reset = source[source.index('static bool turn_start('):source.index('static void turn_begin(')]
         done = source[source.index('static void turn_done('):source.index('/* Ends any turn')]
         check = source[source.index('static void check_turn('):source.index('/* ---- Inbound dispatch')]
+        tts = source.index('static void start_tts(void)')
+        start_tts = source[tts:source.index('\n}\n', tts) + 3]
         code = r'''
 #include <cassert>
 #include <cstdarg>
@@ -74,13 +76,19 @@ bool muse_hatch_caption_at(const char *text, size_t, char *out, size_t cap) {
     strlcpy(out, text, cap); return text[0];
 }
 static void turn_finish() { s_turn.phase = P_IDLE; }
-static void turn_fail(const char *) { turn_finish(); }
+static int fail_events;
+static char fail_text[EV_TEXT];
+static void turn_fail(const char *text) {
+    fail_events++;
+    strlcpy(fail_text, text, sizeof(fail_text));
+    turn_finish();
+}
 static bool ensure_connected() { return true; }
 bool muse_hatch_configured() { return true; }
 static void resampler_init(resampler_t *, int, int) {}
 static void on_dictation_end(bool) {}
 static void log_marks() {}
-''' + done + reset + handlers + check + r'''
+''' + done + reset + handlers + start_tts + check + r'''
 static void begin(bool typed = false) {
     clock_us = 12345;
     assert(turn_start(s_turn.gen + 1, typed));
@@ -90,8 +98,8 @@ static void begin(bool typed = false) {
     strlcpy(s_turn.user_ids[0], "note", sizeof(s_turn.user_ids[0]));
     strlcpy(s_turn.user_ids[1], "parent", sizeof(s_turn.user_ids[1]));
     captions = console_events = 0;
-    done_events = 0;
-    done_text[0] = console_type[0] = console_fields[0] = '\0';
+    done_events = fail_events = 0;
+    done_text[0] = fail_text[0] = console_type[0] = console_fields[0] = '\0';
 }
 static void event(const char *kind, const char *id, const char *parent = "", const char *text = "") {
     cJSON *root = cJSON_CreateObject(), *payload = cJSON_CreateObject();
@@ -154,6 +162,54 @@ static void bounded_rejections() {
     event("message.assistant", "second", "note", "Second");
     assert(s_turn.nmsgs == 2 && s_turn.msgs[0].done && s_turn.msgs[1].done);
 }
+static char s_texts[MAX_MSGS * TEXT_MAX];
+/* A voice reply streamed as these pieces; returns the text kept for its captions. */
+static const char *voice_reply(std::initializer_list<const char *> pieces) {
+    s_turn.texts = s_texts;   /* turn_start() keeps it */
+    begin();
+    event("delta.message_start", "long", "note");
+    for (const char *piece : pieces) event("delta.text_append", "long", "", piece);
+    event("delta.message_done", "long");
+    return s_texts;
+}
+static void cut_inside_a_character() {
+    /* The cut falls inside a two-byte character: it's left out whole, and so is
+     * everything after it, even what would fit in the byte that frees. */
+    static char head[TEXT_MAX];
+    memset(head, 'a', TEXT_MAX - 2);
+    head[TEXT_MAX - 2] = '\0';
+    const char *kept = voice_reply({head, "\xc3\xa9" "bbb", "z"});
+    assert(strlen(kept) == TEXT_MAX - 2 && !strpbrk(kept, "\xc3" "bz"));
+    assert(s_turn.msgs[0].len == TEXT_MAX - 2 + 5 + 1);
+    s_turn.texts = nullptr;
+}
+static void character_split_across_pieces() {
+    /* A piece ends with a character's first byte, exactly at the cut; its last
+     * byte comes in the next piece and doesn't fit. */
+    static char head[TEXT_MAX];
+    memset(head, 'a', TEXT_MAX - 2);
+    head[TEXT_MAX - 2] = '\xc3';
+    head[TEXT_MAX - 1] = '\0';
+    const char *kept = voice_reply({head, "\xa9" "bbb"});
+    assert(strlen(kept) == TEXT_MAX - 2 && !strpbrk(kept, "\xc3" "b"));
+    s_turn.texts = nullptr;
+}
+static void paced_to_the_kept_text() {
+    /* Speaker off, a reply is shown at reading pace: for the text kept, not
+     * for the whole reply, which would crawl the kept part across its time. */
+    static char reply[TEXT_MAX + 1000];
+    memset(reply, 'a', sizeof(reply) - 1);
+    reply[sizeof(reply) - 1] = '\0';
+    const char *kept = voice_reply({reply});
+    start_tts();
+    const msg_t &m = s_turn.msgs[0];
+    assert(m.tts == TTS_ACTIVE && m.len == sizeof(reply) - 1 && strlen(kept) == TEXT_MAX - 1);
+    assert(m.pcm_frames == (uint32_t)((TEXT_MAX - 1) * MIC_RATE / TEXT_CHARS_PER_S));
+    voice_reply({"Short reply"});   /* nothing left out: paced as before */
+    start_tts();
+    assert(s_turn.msgs[0].pcm_frames == (uint32_t)(11 * MIC_RATE / TEXT_CHARS_PER_S));
+    s_turn.texts = nullptr;
+}
 static void capped_voice(bool partial) {
     begin();
     s_turn.agent_busy = true;
@@ -166,10 +222,14 @@ static void capped_voice(bool partial) {
     assert(s_turn.phase == P_WAIT_REPLY && !done_events);
     clock_us++;
     check_turn();
-    assert(s_turn.phase == P_IDLE && done_events == 1);
+    assert(s_turn.phase == P_IDLE && !console_events);
+    if (!partial) { /* no reply at all: the turn fails instead of ending */
+        assert(fail_events == 1 && !strcmp(fail_text, "NO REPLY FROM MUSE") && !done_events);
+        return;
+    }
+    assert(done_events == 1 && !fail_events);
     assert(!strcmp(done_text, "REPLY INCOMPLETE"));
-    assert(!console_events);
-    if (partial) assert(s_turn.msgs[0].len == 13 && !s_turn.msgs[0].done);
+    assert(s_turn.msgs[0].len == 13 && !s_turn.msgs[0].done);
 }
 static void completed_voice() {
     begin();
@@ -223,15 +283,18 @@ int main(int argc, char **argv) {
     case 0: rejected_deltas(); break;
     case 1: valid_parents(); break;
     case 2: bounded_rejections(); break;
-    case 3: capped_voice(false); break;
-    case 4: capped_voice(true); break;
-    case 5: completed_voice(); break;
-    case 6: capped_typed(); break;
-    case 7: completed_voice_at_cap(false, 1000000); break;
-    case 8: completed_voice_at_cap(true, 1000000); break;
-    case 9: completed_voice_at_cap(true, 4000000); break;
-    case 10: capped_voice_with_pending_playback(TTS_QUEUED); break;
-    case 11: capped_voice_with_pending_playback(TTS_ACTIVE); break;
+    case 3: cut_inside_a_character(); break;
+    case 4: character_split_across_pieces(); break;
+    case 5: paced_to_the_kept_text(); break;
+    case 6: capped_voice(false); break;
+    case 7: capped_voice(true); break;
+    case 8: completed_voice(); break;
+    case 9: capped_typed(); break;
+    case 10: completed_voice_at_cap(false, 1000000); break;
+    case 11: completed_voice_at_cap(true, 1000000); break;
+    case 12: completed_voice_at_cap(true, 4000000); break;
+    case 13: capped_voice_with_pending_playback(TTS_QUEUED); break;
+    case 14: capped_voice_with_pending_playback(TTS_ACTIVE); break;
     default: return 2;
     }
 }
@@ -265,24 +328,33 @@ int main(int argc, char **argv) {
     def test_rejection_capacity_preserves_correlation(self):
         self.run_case(2)
 
-    def test_busy_voice_without_messages_is_incomplete_at_cap(self):
+    def test_long_reply_cut_inside_a_character_keeps_whole_characters(self):
         self.run_case(3)
 
-    def test_partial_voice_reply_is_incomplete_at_cap(self):
+    def test_long_reply_character_split_across_pieces_is_left_out(self):
         self.run_case(4)
 
-    def test_completed_voice_reply_has_empty_done_text(self):
+    def test_long_reply_is_paced_to_the_text_kept(self):
         self.run_case(5)
 
-    def test_typed_cap_keeps_complete_false(self):
+    def test_busy_voice_without_messages_fails_at_cap(self):
         self.run_case(6)
 
+    def test_partial_voice_reply_is_incomplete_at_cap(self):
+        self.run_case(7)
+
+    def test_completed_voice_reply_has_empty_done_text(self):
+        self.run_case(8)
+
+    def test_typed_cap_keeps_complete_false(self):
+        self.run_case(9)
+
     def test_completed_voice_at_cap_has_empty_done_text_during_settle_or_busy_hold(self):
-        for name, case in [('idle settle', 7), ('busy settle', 8), ('busy hold', 9)]:
+        for name, case in [('idle settle', 10), ('busy settle', 11), ('busy hold', 12)]:
             with self.subTest(window=name):
                 self.run_case(case)
 
     def test_capped_voice_with_queued_or_active_playback_is_incomplete(self):
-        for name, case in [('queued', 10), ('active', 11)]:
+        for name, case in [('queued', 13), ('active', 14)]:
             with self.subTest(playback=name):
                 self.run_case(case)
