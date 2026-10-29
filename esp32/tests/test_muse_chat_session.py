@@ -277,6 +277,30 @@ static void capped_voice_with_pending_playback(tts_t state) {
     assert(!strcmp(done_text, "REPLY INCOMPLETE"));
     assert(!console_events);
 }
+static void typed_reply_at_cap(bool finished) {
+    /* A typed reply that has finished and is only waiting out the busy hold
+     * ends complete at the cap; one still streaming ends incomplete. */
+    begin(true);
+    clock_us = s_turn.start_us + TEXT_TURN_CAP_US - 1000000;
+    if (finished) {
+        event("message.assistant", "reply", "note", "Complete reply");
+        s_turn.msgs[0].tts = TTS_FINISHED;
+    } else {
+        event("delta.message_start", "reply", "note");
+        event("delta.text_append", "reply", "", "Partial reply");
+    }
+    s_turn.agent_busy = true;
+    clock_us = s_turn.start_us + TEXT_TURN_CAP_US;
+    check_turn();
+    assert(s_turn.phase == P_WAIT_REPLY);
+    console_events = 0;
+    clock_us++;
+    check_turn();
+    assert(s_turn.phase == P_IDLE && !done_events && console_events == 1);
+    assert(!strcmp(console_type, "done"));
+    assert(!strcmp(console_fields, finished ? "\"messages\":1,\"complete\":true"
+                                            : "\"messages\":1,\"complete\":false"));
+}
 int main(int argc, char **argv) {
     assert(argc == 2);
     switch (atoi(argv[1])) {
@@ -295,6 +319,8 @@ int main(int argc, char **argv) {
     case 12: completed_voice_at_cap(true, 4000000); break;
     case 13: capped_voice_with_pending_playback(TTS_QUEUED); break;
     case 14: capped_voice_with_pending_playback(TTS_ACTIVE); break;
+    case 15: typed_reply_at_cap(true); break;
+    case 16: typed_reply_at_cap(false); break;
     default: return 2;
     }
 }
@@ -357,4 +383,9 @@ int main(int argc, char **argv) {
     def test_capped_voice_with_queued_or_active_playback_is_incomplete(self):
         for name, case in [('queued', 13), ('active', 14)]:
             with self.subTest(playback=name):
+                self.run_case(case)
+
+    def test_typed_reply_at_cap_is_complete_only_when_finished(self):
+        for name, case in [('finished', 15), ('streaming', 16)]:
+            with self.subTest(reply=name):
                 self.run_case(case)
