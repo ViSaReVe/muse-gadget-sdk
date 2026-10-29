@@ -1728,7 +1728,8 @@ static void check_turn(void)
             turn_fail("NO REPLY FROM MUSE");
             return;
         }
-        turn_done(complete);
+        /* Finished only if every message is, and the agent isn't still working. */
+        turn_done(complete && !s_turn.agent_busy);
         return;
     }
     if (!s_turn.nmsgs) {

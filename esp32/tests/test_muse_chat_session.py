@@ -263,7 +263,9 @@ static void completed_voice_at_cap(bool busy, int64_t quiet_us) {
     assert(s_turn.phase == P_WAIT_REPLY && !done_events);
     clock_us++;
     check_turn();
-    assert(s_turn.phase == P_IDLE && done_events == 1 && !done_text[0]);
+    assert(s_turn.phase == P_IDLE && done_events == 1);
+    /* A busy agent may still be replying: the cap cut it off. */
+    assert(!strcmp(done_text, busy ? "REPLY INCOMPLETE" : ""));
     assert(!console_events);
 }
 static void capped_voice_with_pending_playback(tts_t state) {
@@ -277,9 +279,9 @@ static void capped_voice_with_pending_playback(tts_t state) {
     assert(!strcmp(done_text, "REPLY INCOMPLETE"));
     assert(!console_events);
 }
-static void typed_reply_at_cap(bool finished) {
-    /* A typed reply that has finished and is only waiting out the busy hold
-     * ends complete at the cap; one still streaming ends incomplete. */
+static void typed_reply_at_cap(bool finished, bool busy) {
+    /* A finished typed reply waiting out the settle ends complete at the cap;
+     * one still streaming, or with the agent still working, ends incomplete. */
     begin(true);
     clock_us = s_turn.start_us + TEXT_TURN_CAP_US - 1000000;
     if (finished) {
@@ -289,7 +291,7 @@ static void typed_reply_at_cap(bool finished) {
         event("delta.message_start", "reply", "note");
         event("delta.text_append", "reply", "", "Partial reply");
     }
-    s_turn.agent_busy = true;
+    s_turn.agent_busy = busy;
     clock_us = s_turn.start_us + TEXT_TURN_CAP_US;
     check_turn();
     assert(s_turn.phase == P_WAIT_REPLY);
@@ -298,8 +300,8 @@ static void typed_reply_at_cap(bool finished) {
     check_turn();
     assert(s_turn.phase == P_IDLE && !done_events && console_events == 1);
     assert(!strcmp(console_type, "done"));
-    assert(!strcmp(console_fields, finished ? "\"messages\":1,\"complete\":true"
-                                            : "\"messages\":1,\"complete\":false"));
+    assert(!strcmp(console_fields, finished && !busy ? "\"messages\":1,\"complete\":true"
+                                                     : "\"messages\":1,\"complete\":false"));
 }
 int main(int argc, char **argv) {
     assert(argc == 2);
@@ -319,8 +321,9 @@ int main(int argc, char **argv) {
     case 12: completed_voice_at_cap(true, 4000000); break;
     case 13: capped_voice_with_pending_playback(TTS_QUEUED); break;
     case 14: capped_voice_with_pending_playback(TTS_ACTIVE); break;
-    case 15: typed_reply_at_cap(true); break;
-    case 16: typed_reply_at_cap(false); break;
+    case 15: typed_reply_at_cap(true, false); break;
+    case 16: typed_reply_at_cap(true, true); break;
+    case 17: typed_reply_at_cap(false, false); break;
     default: return 2;
     }
 }
@@ -375,7 +378,7 @@ int main(int argc, char **argv) {
     def test_typed_cap_keeps_complete_false(self):
         self.run_case(9)
 
-    def test_completed_voice_at_cap_has_empty_done_text_during_settle_or_busy_hold(self):
+    def test_completed_voice_at_cap_is_complete_only_when_the_agent_is_idle(self):
         for name, case in [('idle settle', 10), ('busy settle', 11), ('busy hold', 12)]:
             with self.subTest(window=name):
                 self.run_case(case)
@@ -385,7 +388,7 @@ int main(int argc, char **argv) {
             with self.subTest(playback=name):
                 self.run_case(case)
 
-    def test_typed_reply_at_cap_is_complete_only_when_finished(self):
-        for name, case in [('finished', 15), ('streaming', 16)]:
+    def test_typed_reply_at_cap_is_complete_only_when_finished_and_idle(self):
+        for name, case in [('finished idle', 15), ('finished busy', 16), ('streaming', 17)]:
             with self.subTest(reply=name):
                 self.run_case(case)
